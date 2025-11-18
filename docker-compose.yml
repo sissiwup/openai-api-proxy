@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  openai-proxy:
+    # Der Name des Containers, um ihn leichter zu verwalten.
+    container_name: openai-proxy
+    
+    # Baut das Image aus dem Dockerfile im aktuellen Verzeichnis.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      
+    # Startet den Container automatisch neu, es sei denn, er wird manuell gestoppt.
+    restart: unless-stopped
+    
+    # Der Befehl, der beim Starten des Containers ausgeführt wird.
+    command: ["python", "openai_proxy.py", "--port", "5101"]
+    
+        # Veröffentlicht die Ports des Containers auf dem Host-System
+    ports:
+      - "5101:5101"  # OpenAI API Standard-Port
+      - "5102:5101"  # Host-Port für Chat-Completions -> Responses Mapping
+
+    # Resource Limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    
+  # Restart policy is set above
+    
+    # Health check um Container-Status zu überwachen
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5101/v1/models', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+# In dieser Konfiguration sind keine externen Netzwerke wie das von Traefik erforderlich.
