@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import os
+import copy
 from flask import Flask, request, jsonify, Response
 from waitress import serve
 
@@ -25,6 +26,7 @@ PORT_TARGET_MAP = {
 LOG_FILE_PATH = None
 LOG_LOCK = threading.Lock()
 MAX_LOG_CHARS = 20000
+AUTO_WEB_SEARCH = True
 
 
 def configure_logging(path):
@@ -140,14 +142,204 @@ def convert_messages_to_responses_input(messages):
     return response_input
 
 
+def clone_model_with_profile(model, base_model_id, profile, alias_id=None):
+    variant = copy.deepcopy(model)
+    if alias_id:
+        variant['id'] = alias_id
+    metadata = dict(variant.get('metadata') or {})
+    reason_meta = dict(profile)
+    reason_meta['base_model'] = base_model_id
+    metadata['proxy_reasoning_profile'] = reason_meta
+    variant['metadata'] = metadata
+    return variant
+
+
+def build_reasoning_variants_for_model(model):
+    base_id = model.get('id') if isinstance(model, dict) else None
+    if not isinstance(base_id, str):
+        return [copy.deepcopy(model)]
+
+    variants = []
+    default_profile = {
+        'alias_effort': 'medium',
+        'alias_summary': 'auto',
+        'effort': 'medium',
+        'summary': 'auto',
+        'disable': False
+    }
+    variants.append(clone_model_with_profile(model, base_id, default_profile, alias_id=base_id))
+
+    summary_aliases = ['auto', 'concise', 'detailed']
+    effort_aliases = ['none', 'low', 'medium', 'high']
+
+    for effort in effort_aliases:
+        if effort == 'none':
+            alias_id = f"{base_id}:res-none:sum-never"
+            profile = {
+                'alias_effort': 'none',
+                'alias_summary': 'never',
+                'effort': None,
+                'summary': None,
+                'disable': True
+            }
+            variants.append(clone_model_with_profile(model, base_id, profile, alias_id=alias_id))
+            continue
+        for summary in summary_aliases:
+            if effort == 'medium' and summary == 'auto':
+                continue
+            alias_id = f"{base_id}:res-{effort}:sum-{summary}"
+            profile = {
+                'alias_effort': effort,
+                'alias_summary': summary,
+                'effort': effort,
+                'summary': summary,
+                'disable': False
+            }
+            variants.append(clone_model_with_profile(model, base_id, profile, alias_id=alias_id))
+
+    return variants
+
+
+def expand_models_with_reasoning_variants(models):
+    expanded = []
+    for model in models:
+        expanded.extend(build_reasoning_variants_for_model(model))
+    return expanded
+
+
+def parse_model_reasoning_suffix(model_name):
+    if not isinstance(model_name, str):
+        return model_name, None
+    marker = ':res-'
+    if marker not in model_name:
+        return model_name, None
+
+    base, suffix = model_name.split(marker, 1)
+    if not base:
+        return model_name, None
+
+    segments = suffix.split(':') if suffix else []
+    if not segments:
+        return model_name, None
+
+    effort_alias = segments[0]
+    allowed_efforts = {'none', 'low', 'medium', 'high'}
+    if effort_alias not in allowed_efforts:
+        return model_name, None
+
+    summary_alias = None
+    for seg in segments[1:]:
+        if seg.startswith('sum-'):
+            summary_alias = seg[4:]
+            break
+
+    summary_map = {
+        'auto': 'auto',
+        'concise': 'concise',
+        'detailed': 'detailed',
+        'always': 'detailed',  # backwards compatibility
+        'never': None
+    }
+
+    disable = effort_alias == 'none'
+    if disable:
+        reasoning = {'disable': True}
+        return base, reasoning
+
+    if summary_alias is None:
+        summary_value = 'auto'
+    else:
+        summary_value = summary_map.get(summary_alias)
+        if summary_value is None and summary_alias != 'never':
+            return base, None
+        if summary_alias == 'never':
+            summary_value = None
+
+    reasoning = {
+        'effort': effort_alias,
+        'disable': False
+    }
+    if summary_value is not None:
+        reasoning['summary'] = summary_value
+    return base, reasoning
+
+
+def merge_function_tools(responses_payload, functions):
+    """Überführt Chat-Completions `functions` in Responses-`tools`."""
+    if not functions:
+        return
+
+    tools = responses_payload.setdefault('tools', [])
+    existing_function_names = set()
+    for tool in tools:
+        if tool.get('type') != 'function':
+            continue
+        fn = tool.get('function')
+        if isinstance(fn, dict):
+            name = fn.get('name')
+            if name:
+                existing_function_names.add(name)
+
+    for fn in functions:
+        if not isinstance(fn, dict):
+            continue
+        fn_def = dict(fn)
+        name = fn_def.get('name')
+        if name and name in existing_function_names:
+            continue
+        tools.append({
+            "type": "function",
+            "function": fn_def
+        })
+        if name:
+            existing_function_names.add(name)
+
+
+def derive_tool_choice_from_function_call(function_call):
+    """Mappt `function_call` Vorgaben auf Responses `tool_choice`."""
+    if not function_call:
+        return None
+
+    if isinstance(function_call, str):
+        normalized = function_call.strip()
+        if not normalized:
+            return None
+        lowered = normalized.lower()
+        if lowered in ("none", "auto"):
+            return lowered
+        return {
+            "type": "function",
+            "function": {"name": normalized}
+        }
+
+    if isinstance(function_call, dict):
+        name = function_call.get('name')
+        if name:
+            return {
+                "type": "function",
+                "function": {"name": name}
+            }
+    return None
+
+
 def convert_chat_completions_to_responses_payload(chat_payload):
     """Konvertiert einen Chat-Completions Payload in das Responses-Format."""
     payload = dict(chat_payload or {})
+    functions = payload.pop('functions', None)
+    function_call = payload.pop('function_call', None)
     messages = payload.pop('messages', [])
     payload['input'] = convert_messages_to_responses_input(messages)
 
     if 'max_tokens' in payload and 'max_output_tokens' not in payload:
         payload['max_output_tokens'] = payload.pop('max_tokens')
+
+    if functions:
+        merge_function_tools(payload, functions)
+
+    if function_call and 'tool_choice' not in payload:
+        tool_choice = derive_tool_choice_from_function_call(function_call)
+        if tool_choice:
+            payload['tool_choice'] = tool_choice
 
     return payload
 
@@ -419,6 +611,8 @@ def get_models():
                             filtered_models.append(model)
                         elif incoming_port == "5101" and not has_codex:
                             filtered_models.append(model)
+                    if incoming_port == "5102":
+                        filtered_models = expand_models_with_reasoning_variants(filtered_models)
                     payload['data'] = filtered_models
                 filtered_body = json.dumps(payload).encode('utf-8')
                 content_type = 'application/json'
@@ -508,23 +702,61 @@ def proxy(path):
                 model_name = 'unbekannt'
                 request_payload = None
 
+        alias_reasoning_pref = None
+        reasoning_disabled_by_alias = False
+
         if transform_to_responses and request.is_json:
             try:
                 payload_for_conversion = request_payload
                 if payload_for_conversion is None and data:
                     payload_for_conversion = json.loads(data.decode('utf-8'))
+                if isinstance(payload_for_conversion, dict):
+                    normalized_model, alias_reasoning = parse_model_reasoning_suffix(payload_for_conversion.get('model'))
+                    if normalized_model and normalized_model != payload_for_conversion.get('model'):
+                        payload_for_conversion['model'] = normalized_model
+                        if model_name:
+                            model_name = normalized_model
+                    alias_reasoning_pref = alias_reasoning
+                    if alias_reasoning:
+                        reasoning_disabled_by_alias = bool(alias_reasoning.get('disable'))
+                        if reasoning_disabled_by_alias:
+                            payload_for_conversion.pop('reasoning', None)
+                        elif not payload_for_conversion.get('reasoning'):
+                            reasoning_stub = {}
+                            if alias_reasoning.get('effort'):
+                                reasoning_stub['effort'] = alias_reasoning['effort']
+                            if alias_reasoning.get('summary') is not None:
+                                reasoning_stub['summary'] = alias_reasoning['summary']
+                            if reasoning_stub:
+                                payload_for_conversion['reasoning'] = reasoning_stub
+                request_payload = payload_for_conversion
                 responses_payload = convert_chat_completions_to_responses_payload(payload_for_conversion or {})
                 # Xcode erwartet Websuche; wenn keine Tools angegeben sind, fügen wir das Default-Tool hinzu.
-                if not responses_payload.get('tools'):
+                if AUTO_WEB_SEARCH and not responses_payload.get('tools'):
                     responses_payload['tools'] = [{"type": "web_search"}]
-                reasoning_cfg = responses_payload.get('reasoning')
-                if not reasoning_cfg:
-                    responses_payload['reasoning'] = {"effort": "medium", "summary": "auto"}
+                if reasoning_disabled_by_alias:
+                    responses_payload.pop('reasoning', None)
                 else:
-                    if not reasoning_cfg.get('effort'):
-                        reasoning_cfg['effort'] = "medium"
-                    if not reasoning_cfg.get('summary'):
-                        reasoning_cfg['summary'] = "auto"
+                    if alias_reasoning_pref and not alias_reasoning_pref.get('disable'):
+                        reasoning_cfg = responses_payload.setdefault('reasoning', {})
+                        if alias_reasoning_pref.get('effort'):
+                            reasoning_cfg['effort'] = alias_reasoning_pref['effort']
+                        if 'summary' in alias_reasoning_pref:
+                            summary_value = alias_reasoning_pref.get('summary')
+                            if summary_value is not None:
+                                reasoning_cfg['summary'] = summary_value
+                            elif 'summary' in reasoning_cfg:
+                                reasoning_cfg.pop('summary')
+                    reasoning_cfg = responses_payload.get('reasoning')
+                    if not reasoning_cfg:
+                        responses_payload['reasoning'] = {"effort": "medium", "summary": "auto"}
+                    else:
+                        if not reasoning_cfg.get('effort'):
+                            reasoning_cfg['effort'] = "medium"
+                        if reasoning_cfg.get('summary') is None:
+                            reasoning_cfg.pop('summary', None)
+                        if 'summary' not in reasoning_cfg:
+                            reasoning_cfg['summary'] = "auto"
                 data = json.dumps(responses_payload).encode('utf-8')
                 headers['Content-Type'] = 'application/json'
             except Exception as e:
@@ -675,11 +907,18 @@ if __name__ == '__main__':
                         help='Der Port, auf dem der Proxy-Server laufen soll (Standard: 5101).')
     parser.add_argument('--log', type=str,
                         help='Pfad zu einer Log-Datei, in der Anfragen/Antworten mitgeschnitten werden.')
+    parser.add_argument('--disable-auto-web-search', action='store_true',
+                        help='Deaktiviert die automatische web_search-Tool-Injektion auf Port 5102.')
     
     args = parser.parse_args()
 
+    global AUTO_WEB_SEARCH
+
     if args.log:
         configure_logging(args.log)
+
+    if args.disable_auto_web_search:
+        AUTO_WEB_SEARCH = False
 
     port = args.port
     
