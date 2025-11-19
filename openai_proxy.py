@@ -912,8 +912,6 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    global AUTO_WEB_SEARCH
-
     if args.log:
         configure_logging(args.log)
 

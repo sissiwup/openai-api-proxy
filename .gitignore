@@ -1,0 +1,5 @@
+# Ignore timestamped backup files such as `openai_proxy.py.20251119`
+*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
+
+# Ignore any log output
+*.log
