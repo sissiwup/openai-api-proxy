@@ -11,7 +11,7 @@ A production-ready Python/Flask proxy that sits between your tooling (e.g. Xcode
 - ⚡ **Dual-port forwarding** – Port `5101` behaves like a transparent `/v1/chat/completions` proxy, whereas port `5102` upgrades those calls to `/v1/responses` (with automatic SSE → Chat-completions translation, reasoning summaries, and streaming support).
 - 🧠 **Reasoning & web search defaults** – When a client does not specify tools, the proxy adds OpenAI's `web_search` tool, enables medium-effort reasoning, and requests reasoning summaries so downstream apps can display them without extra work.
 - 🛠️ **Automatic function-tool mapping** – Legacy `/v1/chat/completions` payloads that still use `functions`/`function_call` are transparently translated into the Responses-native `tools` + `tool_choice` fields (including support for forcing a specific function and for `parallel_tool_calls`).
-- 🧩 **Reasoning-aware model aliases** – Port `5102` exposes synthetic model IDs like `gpt-5.1-codex:res-high:sum-detailed`. Selecting such an alias automatically tunes the Responses call (`effort`/`summary`) while the proxy still talks to OpenAI using the real base model ID.
+- 🧩 **Reasoning-aware model aliases** – Port `5102` exposes synthetic model IDs like `gpt-5.1-codex:res-high:sum-auto`. Selecting such an alias automatically tunes the Responses call (`effort`/`summary`) while the proxy still talks to OpenAI using the real base model ID.
 - 🖼️ **Vision & file input compatibility** – Chat-style payloads containing `image_url`, `file_id`, or base64 image data are converted into the shapes the Responses API expects (`input_image`, `input_file`, etc.).
 - 📜 **Model list filtering** – `/v1/models` responses are filtered per port: port `5101` hides Codex-only models, port `5102` shows only Codex-capable models, matching typical IDE routing requirements.
 - 📼 **Structured logging** – Pass `--log <path>` to capture every upstream/downstream request, response, and streaming chunk (logs are rotated on each start).
@@ -122,7 +122,7 @@ The upstream Responses call will contain a `tools` entry for `get_weather` and a
 
 ### Reasoning-aware model aliases on port 5102
 
-- The `/v1/models` response now lists extra IDs like `gpt-5.1-codex:res-none:sum-never`, `gpt-5.1-codex:res-low:sum-concise`, or `gpt-5.1-codex:res-high:sum-detailed`.
+- The `/v1/models` response now lists extra IDs like `gpt-5.1-codex:res-low:sum-none`, `gpt-5.1-codex:res-low:sum-auto`, or `gpt-5.1-codex:res-high:sum-auto`.
 - Pick any alias; the proxy strips the suffix before reaching OpenAI, but applies the encoded reasoning profile on your behalf (only if you didn’t already set a `reasoning` object).
 - The plain base ID is still present and corresponds to the default profile (`effort="medium"`, `summary="auto"`).
 

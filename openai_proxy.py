@@ -169,30 +169,20 @@ def build_reasoning_variants_for_model(model):
     }
     variants.append(clone_model_with_profile(model, base_id, default_profile, alias_id=base_id))
 
-    summary_aliases = ['auto', 'concise', 'detailed']
-    effort_aliases = ['none', 'low', 'medium', 'high']
+    summary_aliases = ['auto', 'none']
+    effort_aliases = ['low', 'medium', 'high']
 
     for effort in effort_aliases:
-        if effort == 'none':
-            alias_id = f"{base_id}:res-none:sum-never"
-            profile = {
-                'alias_effort': 'none',
-                'alias_summary': 'never',
-                'effort': None,
-                'summary': None,
-                'disable': True
-            }
-            variants.append(clone_model_with_profile(model, base_id, profile, alias_id=alias_id))
-            continue
         for summary in summary_aliases:
             if effort == 'medium' and summary == 'auto':
                 continue
             alias_id = f"{base_id}:res-{effort}:sum-{summary}"
+            summary_value = None if summary == 'none' else summary
             profile = {
                 'alias_effort': effort,
                 'alias_summary': summary,
                 'effort': effort,
-                'summary': summary,
+                'summary': summary_value,
                 'disable': False
             }
             variants.append(clone_model_with_profile(model, base_id, profile, alias_id=alias_id))
@@ -235,10 +225,8 @@ def parse_model_reasoning_suffix(model_name):
 
     summary_map = {
         'auto': 'auto',
-        'concise': 'concise',
-        'detailed': 'detailed',
-        'always': 'detailed',  # backwards compatibility
-        'never': None
+        'none': None,
+        'never': None  # backwards compatibility for older aliases
     }
 
     disable = effort_alias == 'none'
@@ -249,11 +237,9 @@ def parse_model_reasoning_suffix(model_name):
     if summary_alias is None:
         summary_value = 'auto'
     else:
-        summary_value = summary_map.get(summary_alias)
-        if summary_value is None and summary_alias != 'never':
+        if summary_alias not in summary_map:
             return base, None
-        if summary_alias == 'never':
-            summary_value = None
+        summary_value = summary_map[summary_alias]
 
     reasoning = {
         'effort': effort_alias,
@@ -369,17 +355,88 @@ def extract_output_texts(response_json):
 def normalize_usage(usage):
     if not isinstance(usage, dict):
         return usage
+    normalized = dict(usage)
     prompt_tokens = usage.get('input_tokens', usage.get('prompt_tokens'))
     completion_tokens = usage.get('output_tokens', usage.get('completion_tokens'))
     total_tokens = usage.get('total_tokens')
-    result = {}
     if prompt_tokens is not None:
-        result['prompt_tokens'] = prompt_tokens
+        normalized['prompt_tokens'] = prompt_tokens
     if completion_tokens is not None:
-        result['completion_tokens'] = completion_tokens
+        normalized['completion_tokens'] = completion_tokens
     if total_tokens is not None:
-        result['total_tokens'] = total_tokens
-    return result or usage
+        normalized['total_tokens'] = total_tokens
+    normalized.pop('input_tokens', None)
+    normalized.pop('output_tokens', None)
+    return normalized
+
+
+def format_reasoning_for_log(reasoning_cfg):
+    if not isinstance(reasoning_cfg, dict):
+        return None
+    parts = []
+    effort = reasoning_cfg.get('effort')
+    if effort:
+        parts.append(f"effort={effort}")
+    summary = reasoning_cfg.get('summary')
+    if summary is not None:
+        parts.append(f"summary={summary}")
+    if not parts:
+        return None
+    return f"reasoning[{', '.join(parts)}]"
+
+
+def format_tools_for_log(tools):
+    if not tools:
+        return None
+    tool_entries = tools if isinstance(tools, list) else [tools]
+    labels = []
+    for entry in tool_entries:
+        if isinstance(entry, dict):
+            tool_type = entry.get('type') or 'unknown'
+            if tool_type == 'function':
+                func = (entry.get('function') or {}).get('name')
+                labels.append(f"function:{func}" if func else 'function')
+            else:
+                labels.append(tool_type)
+        else:
+            labels.append(str(entry))
+    if not labels:
+        return None
+    return f"tools=[{', '.join(labels)}]"
+
+
+def _collect_memory_stats(prefix, value, acc):
+    if isinstance(value, dict):
+        for sub_key, sub_val in value.items():
+            _collect_memory_stats(f"{prefix}.{sub_key}", sub_val, acc)
+    else:
+        val = value
+        acc.append(f"{prefix}={val if val is not None else 'n/a'}")
+
+
+def format_usage_log_suffix(usage):
+    if not isinstance(usage, dict):
+        return ""
+    parts = []
+    total_tokens = usage.get('total_tokens')
+    if total_tokens is not None:
+        parts.append(f"tokens={total_tokens}")
+    reasoning_tokens = usage.get('reasoning_tokens')
+    if reasoning_tokens is None:
+        details = usage.get('output_tokens_details')
+        if isinstance(details, dict):
+            reasoning_tokens = details.get('reasoning_tokens')
+    if reasoning_tokens is not None:
+        parts.append(f"reasoning_tokens={reasoning_tokens}")
+    memory_parts = []
+    for key, value in usage.items():
+        if isinstance(key, str) and 'memory' in key.lower():
+            _collect_memory_stats(key, value, memory_parts)
+    if memory_parts:
+        parts.append(' '.join(memory_parts))
+    if not parts:
+        return ""
+    return "| " + " | ".join(parts)
 
 
 def responses_json_to_chat_completion(response_json, model_name):
@@ -562,10 +619,11 @@ def stream_responses_as_chat(resp, model_name, start_time, incoming_port, origin
         finally:
             resp.close()
             duration = time.time() - start_time if start_time else 0
-            tokens_info = ""
-            if usage:
-                tokens_info = f"| Tokens: {usage.get('total_tokens', '?'):>5}"
-            print(f"END:   {model_name:<20} | Output: {total_bytes:>8} bytes | {duration:.2f}s {tokens_info}")
+            usage_suffix = format_usage_log_suffix(usage)
+            end_line = f"END:   {model_name:<20} | Output: {total_bytes:>8} bytes | {duration:.2f}s"
+            if usage_suffix:
+                end_line = f"{end_line} {usage_suffix}"
+            print(end_line)
 
     return generator()
 
@@ -680,22 +738,26 @@ def proxy(path):
         start_time = None
         request_payload = None
         is_streaming_request = False
+        start_log_params = []
+        should_emit_start_log = False
+        log_reasoning_cfg = None
+        log_tools_cfg = None
         if path in ['v1/chat/completions', 'v1/completions'] and request.is_json:
             try:
                 request_payload = request.get_json()
                 model_name = request_payload.get('model', 'unbekannt')
                 start_time = time.time()
                 is_streaming_request = bool(request_payload.get('stream'))
+                should_emit_start_log = True
                 
                 # Alle Parameter aus dem Request extrahieren
-                params = []
+                start_log_params = []
                 for key, value in request_payload.items():
                     # Überspringe die Nachrichtenliste und das Modell, da diese oft zu lang sind
                     if key not in ['messages', 'model']:
-                        params.append(f"{key}={value}")
-                
-                # Start-Logzeile ausgeben
-                print(f"START: {model_name:<20} | Input: {len(data):>8} bytes | {', '.join(sorted(params))}")
+                        start_log_params.append(f"{key}={value}")
+                log_reasoning_cfg = request_payload.get('reasoning')
+                log_tools_cfg = request_payload.get('tools')
                 
             except Exception as e:
                 print(f"WARNUNG: Fehler beim Verarbeiten der Anfrage: {e}")
@@ -704,6 +766,7 @@ def proxy(path):
 
         alias_reasoning_pref = None
         reasoning_disabled_by_alias = False
+        summary_suppressed = False
 
         if transform_to_responses and request.is_json:
             try:
@@ -711,6 +774,11 @@ def proxy(path):
                 if payload_for_conversion is None and data:
                     payload_for_conversion = json.loads(data.decode('utf-8'))
                 if isinstance(payload_for_conversion, dict):
+                    existing_reasoning = payload_for_conversion.get('reasoning')
+                    if isinstance(existing_reasoning, dict) and 'summary' in existing_reasoning:
+                        if existing_reasoning.get('summary') is None:
+                            existing_reasoning.pop('summary', None)
+                            summary_suppressed = True
                     normalized_model, alias_reasoning = parse_model_reasoning_suffix(payload_for_conversion.get('model'))
                     if normalized_model and normalized_model != payload_for_conversion.get('model'):
                         payload_for_conversion['model'] = normalized_model
@@ -727,6 +795,8 @@ def proxy(path):
                                 reasoning_stub['effort'] = alias_reasoning['effort']
                             if alias_reasoning.get('summary') is not None:
                                 reasoning_stub['summary'] = alias_reasoning['summary']
+                            else:
+                                summary_suppressed = True
                             if reasoning_stub:
                                 payload_for_conversion['reasoning'] = reasoning_stub
                 request_payload = payload_for_conversion
@@ -745,22 +815,43 @@ def proxy(path):
                             summary_value = alias_reasoning_pref.get('summary')
                             if summary_value is not None:
                                 reasoning_cfg['summary'] = summary_value
-                            elif 'summary' in reasoning_cfg:
-                                reasoning_cfg.pop('summary')
+                            else:
+                                reasoning_cfg.pop('summary', None)
+                                summary_suppressed = True
                     reasoning_cfg = responses_payload.get('reasoning')
                     if not reasoning_cfg:
-                        responses_payload['reasoning'] = {"effort": "medium", "summary": "auto"}
+                        default_reasoning = {"effort": "medium"}
+                        if not summary_suppressed:
+                            default_reasoning['summary'] = "auto"
+                        responses_payload['reasoning'] = default_reasoning
                     else:
                         if not reasoning_cfg.get('effort'):
                             reasoning_cfg['effort'] = "medium"
-                        if reasoning_cfg.get('summary') is None:
+                        if summary_suppressed:
                             reasoning_cfg.pop('summary', None)
-                        if 'summary' not in reasoning_cfg:
-                            reasoning_cfg['summary'] = "auto"
+                        else:
+                            if reasoning_cfg.get('summary') is None:
+                                reasoning_cfg.pop('summary', None)
+                            if 'summary' not in reasoning_cfg:
+                                reasoning_cfg['summary'] = "auto"
                 data = json.dumps(responses_payload).encode('utf-8')
                 headers['Content-Type'] = 'application/json'
+                log_reasoning_cfg = responses_payload.get('reasoning')
+                log_tools_cfg = responses_payload.get('tools')
             except Exception as e:
                 print(f"WARNUNG: Konnte Payload nicht in Responses-Format umwandeln: {e}")
+
+        if should_emit_start_log:
+            enhanced_params = list(start_log_params)
+            reasoning_entry = format_reasoning_for_log(log_reasoning_cfg)
+            if reasoning_entry:
+                enhanced_params.append(reasoning_entry)
+            tools_entry = format_tools_for_log(log_tools_cfg)
+            if tools_entry:
+                enhanced_params.append(tools_entry)
+            params_text = ', '.join(sorted(enhanced_params))
+            print(f"START: {model_name or 'unbekannt':<20} | Input: {len(data):>8} bytes | {params_text}")
+            should_emit_start_log = False
 
         log_payload(incoming_port or 'unknown', 'upstream-request', target_path, data if data else '<no body>')
 
@@ -821,11 +912,12 @@ def proxy(path):
                     log_payload(incoming_port or 'unknown', 'downstream-response', path, response_body)
                     total_bytes = len(response_body)
                     duration = time.time() - start_time if start_time else 0
-                    tokens_info = ""
                     usage = chat_json.get('usage')
-                    if isinstance(usage, dict):
-                        tokens_info = f"| Tokens: {usage.get('total_tokens', '?'):>5}"
-                    print(f"END:   {model_name:<20} | Output: {total_bytes:>8} bytes | {duration:.2f}s {tokens_info}")
+                    usage_suffix = format_usage_log_suffix(usage)
+                    end_line = f"END:   {model_name:<20} | Output: {total_bytes:>8} bytes | {duration:.2f}s"
+                    if usage_suffix:
+                        end_line = f"{end_line} {usage_suffix}"
+                    print(end_line)
 
                     response = Response(response_body, status=resp.status_code)
                     excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
@@ -855,13 +947,13 @@ def proxy(path):
                 
                 if model_name and path in ['v1/chat/completions', 'v1/completions']:
                     duration = time.time() - start_time if start_time else 0
-                    tokens_info = ""
                     status_info = ""
-                    
+                    usage_suffix = ""
+
                     # Token-Informationen
                     if response_json and 'usage' in response_json:
-                        usage = response_json['usage']
-                        tokens_info = f"| Tokens: {usage.get('total_tokens', '?'):>5}"
+                        usage = normalize_usage(response_json['usage'])
+                        usage_suffix = format_usage_log_suffix(usage)
                     
                     # Status-Information bei Fehlern
                     if resp.status_code != 200:
@@ -869,7 +961,12 @@ def proxy(path):
                         if resp.status_code == 504:
                             status_info += " (Timeout)"
                     
-                    print(f"END:   {model_name:<20} | Output: {total_bytes:>8} bytes | {duration:.2f}s {tokens_info} {status_info}")
+                    end_line = f"END:   {model_name:<20} | Output: {total_bytes:>8} bytes | {duration:.2f}s"
+                    if usage_suffix:
+                        end_line = f"{end_line} {usage_suffix}"
+                    if status_info:
+                        end_line = f"{end_line} {status_info}"
+                    print(end_line)
                 resp.close()
             
             response = Response(stream_with_logging(incoming_port, target_path), status=resp.status_code)
